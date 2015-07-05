@@ -326,7 +326,7 @@ class KafkaClient(object):
                 raise
             time.sleep(.5)
 
-    def load_metadata_for_topics(self, *topics):
+    def load_metadata_topics(self, topics):
         """
         Fetch broker and topic-partition metadata from the server,
         and update internal data:
@@ -421,6 +421,13 @@ class KafkaClient(object):
                     self.topics_to_brokers[topic_part] = BrokerMetadata(
                         leader, None, None
                     )
+
+    def load_metadata_for_topics(self, *topics):
+        topic_list = [t for t in topics]
+        self.load_metadata_topics(topic_list)
+
+    def load_metadata_for_topic_list(self, topic_list):
+        self.load_metadata_topics(topic_list)
 
     def send_metadata_request(self, payloads=[], fail_on_error=True,
                               callback=None):

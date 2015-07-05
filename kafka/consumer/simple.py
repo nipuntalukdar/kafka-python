@@ -117,13 +117,14 @@ class SimpleConsumer(Consumer):
                  buffer_size=FETCH_BUFFER_SIZE_BYTES,
                  max_buffer_size=MAX_FETCH_BUFFER_SIZE_BYTES,
                  iter_timeout=None,
-                 auto_offset_reset='largest'):
+                 auto_offset_reset='largest', topic_partitions=None):
         super(SimpleConsumer, self).__init__(
             client, group, topic,
             partitions=partitions,
             auto_commit=auto_commit,
             auto_commit_every_n=auto_commit_every_n,
-            auto_commit_every_t=auto_commit_every_t)
+            auto_commit_every_t=auto_commit_every_t,
+            topic_partitions=topic_partitions)
 
         if max_buffer_size is not None and buffer_size > max_buffer_size:
             raise ValueError('buffer_size (%d) is greater than '
@@ -329,11 +330,11 @@ class SimpleConsumer(Consumer):
                 break
 
         try:
-            partition, message = self.queue.get_nowait()
-
+            topic, partition, message = self.queue.get_nowait()
+            
             if update_offset:
                 # Update partition offset
-                self.offsets[partition] = message.offset + 1
+                self.offsets[topic][partition] = message.offset + 1
 
                 # Count, check and commit messages if necessary
                 self.count_since_commit += 1
@@ -342,7 +343,7 @@ class SimpleConsumer(Consumer):
             if get_partition_info is None:
                 get_partition_info = self.partition_info
             if get_partition_info:
-                return partition, message
+                return topic, partition, message
             else:
                 return message
         except Empty:
@@ -369,14 +370,14 @@ class SimpleConsumer(Consumer):
 
     def _fetch(self):
         # Create fetch request payloads for all the partitions
-        partitions = dict((p, self.buffer_size)
-                      for p in self.fetch_offsets.keys())
-        while partitions:
+        topic_partitions = self.topic_partitions
+        while topic_partitions:
             requests = []
-            for partition, buffer_size in six.iteritems(partitions):
-                requests.append(FetchRequest(self.topic, partition,
-                                             self.fetch_offsets[partition],
-                                             buffer_size))
+            for topic, partitions in six.iteritems(topic_partitions):
+                for partition in partitions:
+                    requests.append(FetchRequest(topic, partition,
+                                             self.fetch_offsets[topic][partition],
+                                             self.buffer_size))
             # Send request
             responses = self.client.send_fetch_request(
                 requests,
@@ -387,7 +388,6 @@ class SimpleConsumer(Consumer):
 
             retry_partitions = {}
             for resp in responses:
-
                 try:
                     check_error(resp)
                 except UnknownTopicOrPartitionError:
@@ -406,29 +406,34 @@ class SimpleConsumer(Consumer):
                                 resp.topic, resp.partition)
                     self.reset_partition_offset(resp.partition)
                     # Retry this partition
-                    retry_partitions[resp.partition] = partitions[resp.partition]
+                    if resp.topic not in retry_partitions:
+                        retry_partitions[resp.topic] = []
+                    retry_partitions[resp.topic].append(resp.partition)
                     continue
                 except FailedPayloadsError as e:
                     log.warning('FailedPayloadsError for %s:%d',
                                 e.payload.topic, e.payload.partition)
                     # Retry this partition
-                    retry_partitions[e.payload.partition] = partitions[e.payload.partition]
+                    if e.payload.topic not in retry_partitions:
+                        retry_partitions[e.payload.topic] = []
+                    retry_partitions[e.payload.topic].append(e.payload.partition)
                     continue
 
                 partition = resp.partition
-                buffer_size = partitions[partition]
+                topic = resp.topic
                 try:
                     for message in resp.messages:
-                        if message.offset < self.fetch_offsets[partition]:
+                        if message.offset < self.fetch_offsets[topic][partition]:
                             log.debug('Skipping message %s because its offset is less than the consumer offset',
                                       message)
                             continue
                         # Put the message in our queue
-                        self.queue.put((partition, message))
-                        self.fetch_offsets[partition] = message.offset + 1
+                        self.queue.put((topic, partition, message))
+                        self.fetch_offsets[topic][partition] = message.offset + 1
                 except ConsumerFetchSizeTooSmall:
+                    buffer_size = self.buffer_size
                     if (self.max_buffer_size is not None and
-                            buffer_size == self.max_buffer_size):
+                            self.buffer_size == self.max_buffer_size):
                         log.error('Max fetch size %d too small',
                                   self.max_buffer_size)
                         raise
@@ -439,10 +444,10 @@ class SimpleConsumer(Consumer):
                                           self.max_buffer_size)
                     log.warning('Fetch size too small, increase to %d (2x) '
                                 'and retry', buffer_size)
-                    retry_partitions[partition] = buffer_size
+                    #retry_partitions[topi[partition] = buffer_size
                 except ConsumerNoMoreData as e:
                     log.debug('Iteration was ended by %r', e)
                 except StopIteration:
                     # Stop iterating through this partition
                     log.debug('Done iterating over partition %s', partition)
-            partitions = retry_partitions
+            topic_partitions = retry_partitions

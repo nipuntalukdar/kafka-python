@@ -4,6 +4,8 @@ import atexit
 import logging
 import numbers
 from threading import Lock
+import sys
+from time import sleep
 
 import kafka.common
 from kafka.common import (
@@ -43,19 +45,41 @@ class Consumer(object):
     """
     def __init__(self, client, group, topic, partitions=None, auto_commit=True,
                  auto_commit_every_n=AUTO_COMMIT_MSG_COUNT,
-                 auto_commit_every_t=AUTO_COMMIT_INTERVAL):
+                 auto_commit_every_t=AUTO_COMMIT_INTERVAL,
+                 topic_partitions = None):
 
         self.client = client
-        self.topic = kafka_bytestring(topic)
+        if topic is not None:
+            self.topic = kafka_bytestring(topic)
+        if topic is None and topic_partitions is None:
+            raise ValueError('Insufficient parameter passed')
+        
         self.group = None if group is None else kafka_bytestring(group)
-        self.client.load_metadata_for_topics(topic)
+        self.topic_partitions = None
+        if topic_partitions is not None:
+            assert all(isinstance(x, str) for x in topic_partitions)
+            self.topic_partitions = {}
+            for t in topic_partitions:
+                self.topic_partitions[t.strip()] = topic_partitions[t]
+        if self.topic_partitions is not None:
+            self.client.load_metadata_for_topic_list(self.topic_partitions.keys())
+        else:
+            self.client.load_metadata_for_topics(topic)
+        
         self.offsets = {}
-
-        if partitions is None:
+        
+        if self.topic_partitions is not None:
+            for t in topic_partitions:
+                if self.topic_partitions[t] is None:
+                    self.topic_partitions[t] = self.client.get_partition_ids_for_topic(t)
+        elif partitions is None:
             partitions = self.client.get_partition_ids_for_topic(topic)
         else:
             assert all(isinstance(x, numbers.Integral) for x in partitions)
 
+        if self.topic_partitions is None:
+            self.topic_partitions = {self.topic : partitions}
+        
         # Variables for handling offset commits
         self.commit_lock = Lock()
         self.commit_timer = None
@@ -72,10 +96,12 @@ class Consumer(object):
 
         # Set initial offsets
         if self.group is not None:
-            self.fetch_last_known_offsets(partitions)
+            self.fetch_last_known_offsets()
         else:
-            for partition in partitions:
-                self.offsets[partition] = 0
+            for topic in topic_partitions:
+                self.offsets[topic] = {}
+                for partition in self.topic_partitions[topic]:
+                    self.offsets[topic][partition] = 0
 
         # Register a cleanup handler
         def cleanup(obj):
@@ -83,16 +109,23 @@ class Consumer(object):
         self._cleanup_func = cleanup
         atexit.register(cleanup, self)
 
+
     def fetch_last_known_offsets(self, partitions=None):
         if self.group is None:
             raise ValueError('KafkaClient.group must not be None')
 
+        '''
         if partitions is None:
             partitions = self.client.get_partition_ids_for_topic(self.topic)
-
+        '''
+        off_array = []
+        for topic in self.topic_partitions:
+            for partition in self.topic_partitions[topic]:
+                off_array.append(OffsetFetchRequest(topic, partition))
         responses = self.client.send_offset_fetch_request(
             self.group,
-            [OffsetFetchRequest(self.topic, p) for p in partitions],
+            off_array,
+            #[OffsetFetchRequest(self.topic, p) for p in partitions],
             fail_on_error=False
         )
 
@@ -105,14 +138,16 @@ class Consumer(object):
                 pass
 
             # -1 offset signals no commit is currently stored
+            if resp.topic not in self.offsets:
+                self.offsets[resp.topic] = {}
             if resp.offset == -1:
-                self.offsets[resp.partition] = 0
+                self.offsets[resp.topic][resp.partition] = 0
 
             # Otherwise we committed the stored offset
             # and need to fetch the next one
             else:
-                self.offsets[resp.partition] = resp.offset
-
+                self.offsets[resp.topic][resp.partition] = resp.offset
+    
     def commit(self, partitions=None):
         """Commit stored offsets to Kafka via OffsetCommitRequest (v0)
 
@@ -122,7 +157,6 @@ class Consumer(object):
 
         Returns: True on success, False on failure
         """
-
         # short circuit if nothing happened. This check is kept outside
         # to prevent un-necessarily acquiring a lock for checking the state
         if self.count_since_commit == 0:
@@ -135,18 +169,20 @@ class Consumer(object):
                 return
 
             reqs = []
-            if partitions is None:  # commit all partitions
-                partitions = list(self.offsets.keys())
+            #if partitions is None:  # commit all partitions
+            #    partitions = list(self.offsets.keys())
 
-            log.debug('Committing new offsets for %s, partitions %s',
-                     self.topic, partitions)
-            for partition in partitions:
-                offset = self.offsets[partition]
-                log.debug('Commit offset %d in SimpleConsumer: '
-                          'group=%s, topic=%s, partition=%s',
-                          offset, self.group, self.topic, partition)
+            for topic in self.offsets:
+                log.debug('Committing new offsets for %s, partitions %s',
+                        topic, partitions)
+                partitions = self.offsets[topic].keys()
+                for partition in partitions:
+                    offset = self.offsets[topic][partition]
+                    log.debug('Commit offset %d in SimpleConsumer: '
+                            'group=%s, topic=%s, partition=%s',
+                            offset, self.group, topic, partition)
 
-                reqs.append(OffsetCommitRequest(self.topic, partition,
+                    reqs.append(OffsetCommitRequest(topic, partition,
                                                 offset, None))
 
             try:
@@ -194,27 +230,34 @@ class Consumer(object):
 
             del self._cleanup_func
 
-    def pending(self, partitions=None):
+    def pending(self, topic_partitions=None):
         """
         Gets the pending message count
 
         Keyword Arguments:
             partitions (list): list of partitions to check for, default is to check all
         """
-        if partitions is None:
-            partitions = self.offsets.keys()
+        if topic_partitions is None:
+            topic_partitions = self.topic_partitions
 
         total = 0
         reqs = []
+        partitions = None
 
-        for partition in partitions:
-            reqs.append(OffsetRequest(self.topic, partition, -1, 1))
-
+        for topic in topic_partitions:
+            if topic_partitions[topic] is None:
+                partitions = self.topic_partitions[topic]
+            else:
+                partitions = topic_partitions[topic]
+            for partition in partitions:
+                reqs.append(OffsetRequest(topic, partition, -1, 1))
+             
         resps = self.client.send_offset_request(reqs)
         for resp in resps:
+            topic = resp.topic
             partition = resp.partition
             pending = resp.offsets[0]
-            offset = self.offsets[partition]
+            offset = self.offsets[topic][partition]
             total += pending - offset
 
         return total
